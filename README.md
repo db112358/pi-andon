@@ -98,7 +98,7 @@ light but never lower it.
 ## Title
 
 A session with no title gets one from the session model on its first prompt: a
-32-token completion, temperature 0, ledgered as extension usage rather than
+32-token completion, temperature 0, ledgered as `andon` usage rather than
 session output. `/andon title` and `set_andon` outrank it.
 
 ## Requirements

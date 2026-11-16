@@ -171,7 +171,7 @@ async function summarisePrompt(ctx: ExtensionContext, prompt: string): Promise<s
 		);
 		const message = await stream.result();
 		(ctx.sessionManager as SessionWithUsage).appendUsage?.(
-			"gemba",
+			"andon",
 			message.provider,
 			message.responseModel ?? message.model,
 			message.usage,
