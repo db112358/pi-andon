@@ -1,7 +1,13 @@
-import { readFileSync, statSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { StringEnum, type Usage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { StringEnum, type AssistantMessage, type Model, type Usage } from "@earendil-works/pi-ai";
+import {
+	ModelSelectorComponent,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type Theme,
+} from "@earendil-works/pi-coding-agent";
 import {
 	getCapabilities,
 	hyperlink,
@@ -32,6 +38,8 @@ interface AndonState {
 	word: string;
 	pulsing: boolean;
 	objective?: string;
+	description?: string;
+	note?: string;
 	title?: string;
 	waitUntil?: string;
 }
@@ -44,15 +52,31 @@ interface SupervisorUpdate {
 	sessionId?: string;
 	state?: Light;
 	objective?: string;
+	description?: string;
 	note?: string;
 	label?: string;
 }
 interface SupervisorState {
 	state: Light;
 	objective?: string;
+	description?: string;
 	note?: string;
 	label: string;
 	at: number;
+}
+interface SupervisorReply {
+	state: Light;
+	objective?: string;
+	description?: string;
+	note?: string;
+}
+interface AndonConfig {
+	supervisor?: {
+		enabled?: boolean;
+		provider?: string;
+		model?: string;
+		intervalMs?: number;
+	};
 }
 interface PullRequest {
 	number: number;
@@ -85,6 +109,32 @@ const CHARS_PER_TOKEN = 3.8;
 const PR_MAX_AGE_MS = 5 * 60000;
 const PR_TIMEOUT_MS = 8000;
 const PR_COMMAND = /\b(?:gh\s+pr|git\s+(?:checkout|switch|worktree))\b/;
+const SUPERVISOR_TICK_MS = 2000;
+const SUPERVISOR_INTERVAL_MS = 20000;
+const SUPERVISOR_MIN_INTERVAL_MS = 5000;
+const SUPERVISOR_IDLE_MS = 5 * 60000;
+const SUPERVISOR_TIMEOUT_MS = 30000;
+const SUPERVISOR_MAX_TOKENS = 320;
+const DESCRIPTION_LIMIT = 300;
+const NOTE_LIMIT = 60;
+const USER_WINDOW = 2;
+const ASSISTANT_WINDOW = 3;
+const MESSAGE_LIMIT = 8000;
+const SUPERVISOR_PROMPT = `You are a quiet supervisor observing a coding-agent session on behalf of its user. You never act on the session; you only report what you see.
+
+Reply with exactly one JSON object, no markdown, no prose:
+{"state":"green|amber|red","objective":"...","description":"...","note":"..."}
+
+state:
+- green: the agent is progressing normally
+- amber: the agent looks stalled, looping, retrying, or waiting unusually long
+- red: the agent is blocked, failed, or needs the user
+
+objective: what the agent is doing right now, 2-5 lowercase words in present-participle form, e.g. "surveying the parser". Prefer the agent's own stated intent when it is specific, otherwise infer from the latest request and tool activity.
+
+description: a rolling 1-2 sentence summary of the session so far, present tense, max 300 chars. You are its only keeper: carry forward everything material from your previous description, update it with what is new, and keep it stable when nothing material changed. Write it so it stands alone to someone who cannot see the transcript.
+
+note: only when state is amber or red - at most 8 words saying why, e.g. "same test failing for 4m".`;
 class AndonCard {
 	constructor(
 		private readonly getTheme: () => Theme,
@@ -119,6 +169,76 @@ function parseDuration(input: string): number | undefined {
 	const minutes = Number(match[2] ?? 0);
 	const seconds = Number(match[3] ?? 0);
 	return Math.round((hours * 3600 + minutes * 60 + seconds) * 1000);
+}
+function agentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+function configPath(): string {
+	return join(agentDir(), "andon.json");
+}
+function loadConfig(): AndonConfig {
+	try {
+		return JSON.parse(readFileSync(configPath(), "utf8")) as AndonConfig;
+	} catch {
+		return {};
+	}
+}
+function saveConfig(config: AndonConfig): void {
+	try {
+		const path = configPath();
+		mkdirSync(dirname(path), { recursive: true });
+		writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`);
+	} catch {}
+}
+function messageText(message: unknown): string {
+	if (!message || typeof message !== "object") return "";
+	const content = (message as { content?: unknown }).content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.flatMap((block) => {
+			const value = block as { type?: string; text?: string };
+			return value?.type === "text" && typeof value.text === "string" ? [value.text] : [];
+		})
+		.join("\n");
+}
+function clampText(text: string, max: number): string {
+	const trimmed = text.trim();
+	return trimmed.length <= max ? trimmed : `${trimmed.slice(0, max).trimEnd()} …[truncated]`;
+}
+function summariseArgs(args: unknown): string {
+	if (!args || typeof args !== "object") return "";
+	const record = args as Record<string, unknown>;
+	for (const key of ["path", "file_path", "command", "pattern", "query", "url", "title", "description"]) {
+		const value = record[key];
+		if (typeof value === "string" && value) return `${key}=${truncatePlain(value, 60)}`;
+	}
+	return "";
+}
+function parseSupervisorReply(text: string): SupervisorReply | undefined {
+	const start = text.indexOf("{");
+	const end = text.lastIndexOf("}");
+	if (start === -1 || end <= start) return undefined;
+	try {
+		const raw = JSON.parse(text.slice(start, end + 1)) as {
+			state?: unknown;
+			objective?: unknown;
+			description?: unknown;
+			note?: unknown;
+		};
+		if (raw.state !== "green" && raw.state !== "amber" && raw.state !== "red") return undefined;
+		const objective = typeof raw.objective === "string" ? truncatePlain(raw.objective, 60) : "";
+		const description = typeof raw.description === "string" ? truncatePlain(raw.description, DESCRIPTION_LIMIT) : "";
+		const note = typeof raw.note === "string" ? truncatePlain(raw.note, NOTE_LIMIT) : "";
+		return {
+			state: raw.state,
+			objective: objective || undefined,
+			description: description || undefined,
+			note: note || undefined,
+		};
+	} catch {
+		return undefined;
+	}
 }
 function findRepo(cwd: string): RepoRef | undefined {
 	let dir = cwd;
@@ -204,6 +324,7 @@ export default function andonExtension(pi: ExtensionAPI): void {
 			name: string;
 			startedAt: number;
 			command?: string;
+			summary: string;
 		}
 	>();
 	let wait:
@@ -222,6 +343,19 @@ export default function andonExtension(pi: ExtensionAPI): void {
 	let contextPercent: number | undefined;
 	let summaryAt = 0;
 	let supervisor: SupervisorState | undefined;
+	let recentTools: { name: string; summary: string; ms: number; isError: boolean }[] = [];
+	let turnStartedAt = 0;
+	let lastActivityAt = 0;
+	let dirty = false;
+	let inFlight = false;
+	let lastCallAt = 0;
+	let fails = 0;
+	let calls = 0;
+	let supervisorCost = 0;
+	let supervisorError: string | undefined;
+	let externalSupervisorAt = 0;
+	let supervisorTimer: ReturnType<typeof setInterval> | undefined;
+	let config: AndonConfig = {};
 	let pullRequest: PullRequest | undefined;
 	let prBranch: string | undefined;
 	let prCheckedAt = 0;
@@ -306,6 +440,197 @@ export default function andonExtension(pi: ExtensionAPI): void {
 	function currentObjective(): string | undefined {
 		if (summary && Date.now() - summaryAt <= SUMMARY_GRACE_MS) return summary;
 		return supervisorFresh()?.objective ?? summary;
+	}
+	function supervisorEnabled(): boolean {
+		return config.supervisor?.enabled !== false;
+	}
+	function supervisorInterval(): number {
+		return Math.max(config.supervisor?.intervalMs ?? SUPERVISOR_INTERVAL_MS, SUPERVISOR_MIN_INTERVAL_MS);
+	}
+	function supervisorModel(ctx: ExtensionContext): Model<any> | undefined {
+		const configured = config.supervisor;
+		if (configured?.provider && configured.model) {
+			return ctx.modelRegistry.find(configured.provider, configured.model);
+		}
+		return ctx.model;
+	}
+	async function pickSupervisorModel(ctx: ExtensionContext): Promise<Model<any> | undefined> {
+		if (ctx.mode !== "tui") return undefined;
+		const { runtime } = ctx.modelRegistry as unknown as {
+			runtime: ConstructorParameters<typeof ModelSelectorComponent>[2];
+		};
+		return ctx.ui.custom<Model<any> | undefined>(
+			(tui, _theme, _keybindings, done) =>
+				new ModelSelectorComponent(
+					tui,
+					supervisorModel(ctx) ?? (null as unknown as Model<any>),
+					runtime,
+					ctx.scopedModels,
+					(picked) => done(picked),
+					() => done(undefined),
+				),
+		);
+	}
+	function mark(): void {
+		lastActivityAt = Date.now();
+		dirty = true;
+	}
+	function tick(): void {
+		const ctx = lastCtx;
+		if (!ctx || !supervisorEnabled() || inFlight || !dirty) return;
+		if (Date.now() - externalSupervisorAt <= SUPERVISOR_FRESH_MS) return;
+		if (Date.now() - lastCallAt < supervisorInterval()) return;
+		if (phase === "idle" && Date.now() - lastActivityAt > SUPERVISOR_IDLE_MS) {
+			dirty = false;
+			return;
+		}
+		void runSupervisor(ctx);
+	}
+	function digest(ctx: ExtensionContext): string {
+		const now = Date.now();
+		const lines: string[] = [];
+		if (supervisor) {
+			lines.push(`--- your previous summary (${formatDuration(now - supervisor.at)} ago) ---`);
+			lines.push(`state: ${supervisor.state}`);
+			if (supervisor.objective) lines.push(`objective: ${supervisor.objective}`);
+			if (supervisor.description) lines.push(`description: ${supervisor.description}`);
+			if (supervisor.note) lines.push(`note: ${supervisor.note}`);
+		}
+		lines.push(`cwd: ${ctx.cwd}`);
+		lines.push(
+			`phase: ${phase}${lastOutcome ? ` (${lastOutcome})` : ""} · turn ${turnStartedAt ? formatDuration(now - turnStartedAt) : "0s"} · context ${contextPercent !== undefined ? `${Math.round(contextPercent)}%` : "?"}`,
+		);
+		const running = [...activeTools.values()];
+		if (running.length) {
+			lines.push(
+				`running: ${running.map((tool) => `${tool.name} ${formatDuration(now - tool.startedAt)}`).join(", ")}`,
+			);
+		}
+		if (uiPrompt) lines.push(`blocking prompt: ${uiPrompt.kind}${uiPrompt.title ? ` ${uiPrompt.title}` : ""}`);
+		if (summary) lines.push(`model-stated intent: ${truncatePlain(summary, 80)}`);
+		const entries = ctx.sessionManager.getBranch();
+		const users: string[] = [];
+		const assistants: string[] = [];
+		for (
+			let i = entries.length - 1;
+			i >= 0 && (users.length < USER_WINDOW || assistants.length < ASSISTANT_WINDOW);
+			i--
+		) {
+			const entry = entries[i];
+			if (entry.type !== "message") continue;
+			const text = messageText(entry.message).trim();
+			if (!text) continue;
+			if (entry.message.role === "user" && users.length < USER_WINDOW) users.push(text);
+			else if (entry.message.role === "assistant" && assistants.length < ASSISTANT_WINDOW) assistants.push(text);
+		}
+		if (users.length) {
+			lines.push("--- user messages (verbatim, oldest first) ---");
+			for (const [index, text] of [...users].reverse().entries())
+				lines.push(`[${index + 1}] ${clampText(text, MESSAGE_LIMIT)}`);
+		}
+		if (assistants.length) {
+			lines.push("--- assistant replies (verbatim, oldest first) ---");
+			for (const [index, text] of [...assistants].reverse().entries())
+				lines.push(`[${index + 1}] ${clampText(text, MESSAGE_LIMIT)}`);
+		}
+		if (recentTools.length) {
+			const tools = recentTools
+				.slice(-8)
+				.map(
+					(tool) =>
+						`- ${[tool.name, tool.summary, `${tool.ms}ms`, tool.isError ? "ERROR" : ""].filter(Boolean).join(" ")}`,
+				);
+			lines.push(`--- recent tool calls (results withheld) ---\n${tools.join("\n")}`);
+		}
+		return lines.join("\n");
+	}
+	function recordSupervisorUsage(ctx: ExtensionContext, message: AssistantMessage): void {
+		supervisorCost += message.usage?.cost?.total ?? 0;
+		(ctx.sessionManager as SessionWithUsage).appendUsage?.(
+			"andon",
+			message.provider,
+			message.responseModel ?? message.model,
+			message.usage,
+		);
+	}
+	async function runSupervisor(ctx: ExtensionContext): Promise<void> {
+		const model = supervisorModel(ctx);
+		if (!model) return;
+		const started = generation;
+		dirty = false;
+		inFlight = true;
+		lastCallAt = Date.now();
+		try {
+			const stream = ctx.modelRegistry.streamSimple(
+				model,
+				{
+					systemPrompt: SUPERVISOR_PROMPT,
+					messages: [{ role: "user", content: digest(ctx), timestamp: Date.now() }],
+				},
+				{
+					maxTokens: SUPERVISOR_MAX_TOKENS,
+					temperature: 0,
+					reasoning: "minimal",
+					signal: AbortSignal.timeout(SUPERVISOR_TIMEOUT_MS),
+					sessionId: ctx.sessionManager.getSessionId(),
+				},
+			);
+			const message = await stream.result();
+			if (started !== generation) return;
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				throw new Error(message.errorMessage ?? message.stopReason);
+			}
+			const reply = message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join(" ");
+			const parsed = parseSupervisorReply(reply);
+			if (!parsed) throw new Error("unparseable reply");
+			supervisor = {
+				state: parsed.state,
+				objective: parsed.objective,
+				description: parsed.description,
+				note: parsed.note,
+				label: "supervisor",
+				at: Date.now(),
+			};
+			fails = 0;
+			supervisorError = undefined;
+			calls += 1;
+			recordSupervisorUsage(ctx, message);
+			pi.events.emit("andon:update", {
+				sessionId: ctx.sessionManager.getSessionId(),
+				label: "andon",
+				state: parsed.state,
+				objective: parsed.objective,
+				description: parsed.description,
+				note: parsed.note,
+			});
+			render();
+		} catch (caught) {
+			if (started !== generation) return;
+			fails += 1;
+			supervisorError = caught instanceof Error ? caught.message : String(caught);
+			lastCallAt = Date.now() + Math.min(fails, 8) * 30000;
+		} finally {
+			inFlight = false;
+		}
+	}
+	function supervisorStatus(ctx: ExtensionContext): string {
+		const model = supervisorModel(ctx);
+		const parts = [supervisorEnabled() && model ? "on" : "off"];
+		parts.push(model ? `${model.provider}/${model.id}` : "no model");
+		parts.push(`every ${formatDuration(supervisorInterval())}`);
+		if (calls) parts.push(`${calls} calls · $${supervisorCost.toFixed(4)}`);
+		if (supervisor) {
+			const objective = supervisor.objective ? ` "${supervisor.objective}"` : "";
+			parts.push(
+				supervisor.at
+					? `last ${supervisor.state}${objective} ${formatDuration(Date.now() - supervisor.at)} ago`
+					: `last ${supervisor.state}${objective} from the session record`,
+			);
+		}
+		if (supervisor?.description) parts.push(`desc: ${truncatePlain(supervisor.description, 140)}`);
+		if (externalSupervisorAt) parts.push("an external supervisor is driving this session");
+		if (supervisorError) parts.push(`error: ${supervisorError}`);
+		return `andon supervisor: ${parts.join(" · ")}`;
 	}
 	async function refreshPullRequest(ctx: ExtensionContext): Promise<void> {
 		if (!ctx.hasUI || prLooking) return;
@@ -482,16 +807,19 @@ export default function andonExtension(pi: ExtensionAPI): void {
 			word: resolved.word,
 			pulsing: resolved.pulsing,
 			objective: currentObjective(),
+			description: supervisor?.description,
+			note: supervisorEscalation()?.note,
 			title,
 			waitUntil: wait ? new Date(wait.startedAt + wait.expectedMs).toISOString() : undefined,
 		};
 	}
 	function recordState(resolved: Resolved): void {
-		const key = `${resolved.light}/${resolved.word}`;
+		const payload = statePayload(resolved);
+		const key = JSON.stringify(payload);
 		if (key === lastRecorded) return;
 		lastRecorded = key;
 		try {
-			pi.appendEntry("andon.state", statePayload(resolved));
+			pi.appendEntry("andon.state", payload);
 		} catch {}
 	}
 	function render(ctx?: ExtensionContext): void {
@@ -544,10 +872,11 @@ export default function andonExtension(pi: ExtensionAPI): void {
 	}
 	function restore(ctx: ExtensionContext): void {
 		let data: AndonData | undefined;
+		let state: AndonState | undefined;
 		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type === "custom" && entry.customType === "andon") {
-				data = entry.data as AndonData | undefined;
-			}
+			if (entry.type !== "custom") continue;
+			if (entry.customType === "andon") data = entry.data as AndonData | undefined;
+			if (entry.customType === "andon.state") state = entry.data as AndonState | undefined;
 		}
 		if (data) {
 			title = data.title;
@@ -555,6 +884,16 @@ export default function andonExtension(pi: ExtensionAPI): void {
 			summary = data.summary;
 			overrideState = data.overrideState;
 			visible = data.visible ?? true;
+		}
+		if (state?.light) {
+			supervisor = {
+				state: state.light,
+				objective: state.objective,
+				description: state.description,
+				note: state.note,
+				label: "supervisor",
+				at: 0,
+			};
 		}
 	}
 	pi.events.on("pulse:tps", (payload) => {
@@ -574,9 +913,11 @@ export default function andonExtension(pi: ExtensionAPI): void {
 		const ctx = lastCtx;
 		if (!update || !ctx) return;
 		if (update.sessionId && update.sessionId !== ctx.sessionManager.getSessionId()) return;
+		if (update.label !== "andon") externalSupervisorAt = Date.now();
 		supervisor = {
 			state: update.state ?? "green",
 			objective: update.objective || undefined,
+			description: update.description || undefined,
 			note: update.note || undefined,
 			label: update.label || "supervisor",
 			at: Date.now(),
@@ -605,6 +946,70 @@ export default function andonExtension(pi: ExtensionAPI): void {
 					render(ctx);
 					ctx.ui.notify(visible ? "Andon card shown" : "Andon card hidden", "info");
 					return;
+				case "supervisor": {
+					const words = rest.split(/\s+/).filter(Boolean);
+					const action = (words[0] ?? "").toLowerCase();
+					if (!action || action === "status") {
+						ctx.ui.notify(supervisorStatus(ctx), "info");
+						return;
+					}
+					if (action === "on" || action === "off") {
+						config = { ...config, supervisor: { ...config.supervisor, enabled: action === "on" } };
+						saveConfig(config);
+						if (action === "on") mark();
+						ctx.ui.notify(supervisorStatus(ctx), "info");
+						return;
+					}
+					if (action === "model") {
+						const wanted = words.slice(1).join(" ").trim();
+						if (!wanted) {
+							const picked = await pickSupervisorModel(ctx);
+							if (!picked) return;
+							config = {
+								...config,
+								supervisor: {
+									...config.supervisor,
+									provider: picked.provider,
+									model: picked.id,
+									enabled: true,
+								},
+							};
+							saveConfig(config);
+							mark();
+							ctx.ui.notify(`andon supervisor model: ${picked.provider}/${picked.id}`, "info");
+							return;
+						}
+						const slash = wanted.indexOf("/");
+						const provider = slash > 0 ? wanted.slice(0, slash) : undefined;
+						const id = slash > 0 ? wanted.slice(slash + 1) : undefined;
+						const found = provider && id ? ctx.modelRegistry.find(provider, id) : undefined;
+						if (!found) {
+							ctx.ui.notify("Usage: /andon supervisor model <provider>/<model-id>", "error");
+							return;
+						}
+						config = {
+							...config,
+							supervisor: { ...config.supervisor, provider: found.provider, model: found.id, enabled: true },
+						};
+						saveConfig(config);
+						mark();
+						ctx.ui.notify(`andon supervisor model: ${found.provider}/${found.id}`, "info");
+						return;
+					}
+					if (action === "interval") {
+						const ms = parseDuration(words.slice(1).join(""));
+						if (ms === undefined) {
+							ctx.ui.notify("Usage: /andon supervisor interval <duration>", "error");
+							return;
+						}
+						config = { ...config, supervisor: { ...config.supervisor, intervalMs: ms } };
+						saveConfig(config);
+						ctx.ui.notify(`andon supervisor interval: ${formatDuration(supervisorInterval())}`, "info");
+						return;
+					}
+					ctx.ui.notify("Usage: /andon supervisor [on|off|model <provider>/<id>|interval <duration>]", "error");
+					return;
+				}
 				case "title": {
 					let next = rest;
 					if (!next) {
@@ -803,21 +1208,35 @@ export default function andonExtension(pi: ExtensionAPI): void {
 		phase = "idle";
 		lastOutcome = undefined;
 		activeTools = new Map();
+		recentTools = [];
 		wait = undefined;
 		uiPrompt = undefined;
 		contextPercent = undefined;
+		turnStartedAt = 0;
+		lastActivityAt = Date.now();
+		dirty = false;
+		inFlight = false;
+		lastCallAt = 0;
+		fails = 0;
+		calls = 0;
+		supervisorCost = 0;
+		supervisorError = undefined;
+		externalSupervisorAt = 0;
+		config = loadConfig();
 		widgetShown = false;
 		cardTui = undefined;
 		lastTitleText = undefined;
 		deltas = [];
 		pulseTps = undefined;
+		supervisor = undefined;
 		resetState();
 		restore(ctx);
-		supervisor = undefined;
 		pullRequest = undefined;
 		prBranch = undefined;
 		prCheckedAt = 0;
 		prLooking = false;
+		if (supervisorTimer) clearInterval(supervisorTimer);
+		supervisorTimer = setInterval(tick, SUPERVISOR_TICK_MS);
 		render(ctx);
 		setTimeout(() => {
 			lastBroadcast = "";
@@ -827,9 +1246,11 @@ export default function andonExtension(pi: ExtensionAPI): void {
 		void refreshPullRequest(ctx);
 	});
 	pi.on("session_tree", async (_event, ctx) => {
+		generation += 1;
+		supervisor = undefined;
+		recentTools = [];
 		resetState();
 		restore(ctx);
-		supervisor = undefined;
 		render(ctx);
 	});
 	pi.on("session_info_changed", async (event, ctx) => {
@@ -841,6 +1262,7 @@ export default function andonExtension(pi: ExtensionAPI): void {
 		}
 	});
 	pi.on("before_agent_start", async (event, ctx) => {
+		mark();
 		refreshPullRequestIfStale(ctx);
 		if (event.messageType !== "user" || title) return;
 		const line = event.prompt
@@ -866,10 +1288,12 @@ export default function andonExtension(pi: ExtensionAPI): void {
 		phase = "working";
 		lastOutcome = undefined;
 		activeTools.clear();
+		turnStartedAt = Date.now();
 		wait = undefined;
 		overrideState = undefined;
 		deltas = [];
 		pulseTps = undefined;
+		mark();
 		persist();
 		render(ctx);
 	});
@@ -887,34 +1311,53 @@ export default function andonExtension(pi: ExtensionAPI): void {
 		phase = lastOutcome === "error" || lastOutcome === "aborted" ? "failed" : "idle";
 		activeTools.clear();
 		wait = undefined;
+		mark();
 		render(ctx);
+	});
+	pi.on("session_compact", async () => {
+		mark();
 	});
 	pi.on("tool_execution_start", async (event, ctx) => {
 		activeTools.set(event.toolCallId, {
 			name: event.toolName,
 			startedAt: Date.now(),
 			command: toolCommand(event.args),
+			summary: summariseArgs(event.args),
 		});
 		if (wait && !wait.toolCallId && event.toolName !== "set_andon") wait.toolCallId = event.toolCallId;
+		mark();
 		render(ctx);
 	});
 	pi.on("tool_execution_end", async (event, ctx) => {
 		const tool = activeTools.get(event.toolCallId);
 		activeTools.delete(event.toolCallId);
+		if (tool) {
+			recentTools.push({
+				name: tool.name,
+				summary: tool.summary || tool.command || "",
+				ms: event.durationMs ?? Date.now() - tool.startedAt,
+				isError: event.isError,
+			});
+			if (recentTools.length > 12) recentTools.shift();
+		}
 		if (wait?.toolCallId === event.toolCallId) wait = undefined;
 		if (tool?.command && PR_COMMAND.test(tool.command)) void refreshPullRequest(ctx);
+		mark();
 		render(ctx);
 	});
 	pi.on("ui_prompt_start", async (event, ctx) => {
 		uiPrompt = { kind: event.kind, title: event.title };
+		mark();
 		render(ctx);
 	});
 	pi.on("ui_prompt_end", async (_event, ctx) => {
 		uiPrompt = undefined;
+		mark();
 		render(ctx);
 	});
 	pi.on("turn_end", async (_event, ctx) => {
 		contextPercent = ctx.getContextUsage()?.percent ?? undefined;
+		mark();
 		render(ctx);
 	});
 	pi.on("session_shutdown", async (_event, ctx) => {
@@ -922,6 +1365,10 @@ export default function andonExtension(pi: ExtensionAPI): void {
 		if (timer) {
 			clearInterval(timer);
 			timer = undefined;
+		}
+		if (supervisorTimer) {
+			clearInterval(supervisorTimer);
+			supervisorTimer = undefined;
 		}
 		if (ctx.hasUI) {
 			ctx.ui.setWidget("andon", undefined);

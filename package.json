@@ -1,7 +1,7 @@
 {
   "name": "pi-andon",
-  "version": "1.0.0",
-  "description": "An andon light for pi sessions: a status card and terminal title for green, amber and red, driven by the set_andon tool.",
+  "version": "1.1.0",
+  "description": "An andon light for pi sessions: a status card and terminal title with a supervisor's objective and rolling summary, driven by the set_andon tool.",
   "keywords": ["pi", "pi-package", "extension", "andon"],
   "license": "MIT",
   "type": "module",
@@ -13,7 +13,7 @@
   "bugs": {
     "url": "https://github.com/db112358/pi-andon/issues"
   },
-  "files": ["extensions", "README.md", "LICENSE"],
+  "files": ["extensions", "CHANGELOG.md", "README.md", "LICENSE"],
   "pi": {
     "extensions": ["./extensions/andon.ts"]
   },
