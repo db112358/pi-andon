@@ -16,6 +16,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
+	type AutocompleteItem,
 	type TUI,
 } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -135,6 +136,17 @@ objective: what the agent is doing right now, 2-5 lowercase words in present-par
 description: a rolling 1-2 sentence summary of the session so far, present tense, max 300 chars. You are its only keeper: carry forward everything material from your previous description, update it with what is new, and keep it stable when nothing material changed. Write it so it stands alone to someone who cannot see the transcript.
 
 note: only when state is amber or red - at most 8 words saying why, e.g. "same test failing for 4m".`;
+const ANDON_VERBS: Array<[string, string | undefined]> = [
+	["toggle", "show or hide the card"],
+	["show", undefined],
+	["hide", undefined],
+	["edit", "edit the summary in an editor"],
+	["title", "set the session title"],
+	["state", "green | amber | red | auto"],
+	["wait", "declare or clear a wait"],
+	["clear", "clear the summary, the wait and the explicit state"],
+	["supervisor", "model, cadence, on/off, status"],
+];
 class AndonCard {
 	constructor(
 		private readonly getTheme: () => Theme,
@@ -925,8 +937,38 @@ export default function andonExtension(pi: ExtensionAPI): void {
 		};
 		render();
 	});
+	function argumentCompletions(prefix: string): AutocompleteItem[] | null {
+		const items: AutocompleteItem[] = [];
+		const add = (value: string, description?: string) => {
+			items.push(description ? { value, label: value, description } : { value, label: value });
+		};
+		if (/^supervisor\s+model\s+/.test(prefix)) {
+			for (const model of lastCtx?.modelRegistry.getAvailable() ?? []) {
+				add(`supervisor model ${model.provider}/${model.id}`, model.name);
+			}
+		} else {
+			for (const [verb, description] of ANDON_VERBS) add(verb, description);
+			for (const state of ["green", "amber", "red", "auto"]) {
+				add(`state ${state}`, state === "auto" ? "clear the explicit state" : undefined);
+			}
+			for (const wait of ["30s", "1m", "5m", "10m", "30m", "1h", "off"]) add(`wait ${wait}`);
+			const supervisor: Array<[string, string | undefined]> = [
+				["supervisor status", "model, cadence, calls, spend, last judgement"],
+				["supervisor on", undefined],
+				["supervisor off", undefined],
+				["supervisor model", "provider/model; the TUI picker when omitted"],
+			];
+			for (const [value, description] of supervisor) add(value, description);
+			for (const interval of ["10s", "30s", "1m", "2m", "5m", "10m"]) {
+				add(`supervisor interval ${interval}`);
+			}
+		}
+		const filtered = items.filter((item) => item.value.startsWith(prefix));
+		return filtered.length ? filtered : null;
+	}
 	pi.registerCommand("andon", {
-		description: "Show, hide, or edit the andon status card",
+		description: "Show, hide or edit the andon card, or drive its supervisor",
+		getArgumentCompletions: argumentCompletions,
 		handler: async (args, ctx) => {
 			const input = args.trim();
 			const space = input.indexOf(" ");
