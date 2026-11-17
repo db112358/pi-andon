@@ -64,10 +64,10 @@ tool result still gets the light.
 
 ## The supervisor
 
-Every 20 seconds while a session is active, the extension asks a model to read a
-digest of the session — verbatim user messages, assistant replies, running and
-recent tools, phase, elapsed time, context, the model's own declared intent and
-its previous summary — and answer with one object:
+Every 20 seconds while a TUI or RPC session is active, the extension asks a
+model to read a digest of the session — verbatim user messages, assistant
+replies, running and recent tools, phase, elapsed time, context, the model's
+own declared intent and its previous summary — and answer with one object:
 
 ```json
 {

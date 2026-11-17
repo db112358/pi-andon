@@ -478,6 +478,7 @@ export default function andonExtension(pi: ExtensionAPI): void {
 	function tick(): void {
 		const ctx = lastCtx;
 		if (!ctx || !supervisorEnabled() || inFlight || !dirty) return;
+		if (ctx.mode !== "tui" && ctx.mode !== "rpc") return;
 		if (Date.now() - externalSupervisorAt <= SUPERVISOR_FRESH_MS) return;
 		if (Date.now() - lastCallAt < supervisorInterval()) return;
 		if (phase === "idle" && Date.now() - lastActivityAt > SUPERVISOR_IDLE_MS) {
