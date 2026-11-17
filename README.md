@@ -46,7 +46,9 @@ prompt, an aborted run, a failure, or an explicit `set_andon` call.
 - `/andon wait <duration>` or `/andon wait off`
 - `/andon clear` — clear the summary, the wait and the explicit state
 
-`Ctrl+Shift+A` toggles the card.
+`Ctrl+Shift+A` toggles the card. Every argument completes as you type: the
+verbs, the state values, the wait durations, the supervisor settings, and the
+models the session can reach.
 
 ## The tool
 
